@@ -15,18 +15,23 @@
 import NIOCore
 @_spi(ProtocolProvider) @_spi(Essentials) import SwiftNetwork
 
-// TODO: Make ScheduledEntry ~Copyable with UniqueArray / PriorityQueue
 @available(anyAppleOS 26, *)
 struct ScheduledEntry {
-    var milliseconds: Int64
-    var reference: SwiftNetwork.TimerReference
-    var scheduledTask: Scheduled<Void>??
+    var handle: NIOScheduledCallback?
+    var task: () -> Void
 }
 
 @available(anyAppleOS 26, *)
-final class QUICChannelEventLoop: NetworkContext.Scheduler, CustomStringConvertible {
+extension ScheduledEntry: NIOScheduledCallbackHandler {
+    func handleScheduledCallback(eventLoop: some NIOCore.EventLoop) {
+        self.task()
+    }
+}
 
-    internal let description = "QUICChannelEventLoop"
+@available(anyAppleOS 26, *)
+final class EventLoopBackedScheduler: NetworkContext.Scheduler, CustomStringConvertible {
+    internal var description: String { "EventLoopBackedScheduler" }
+
     internal var runningInScheduler: Bool {
         self.eventLoop.inEventLoop
     }
@@ -37,16 +42,16 @@ final class QUICChannelEventLoop: NetworkContext.Scheduler, CustomStringConverti
         self.eventLoop = eventLoop
     }
 
-    private struct UnsafeTransfer<Wrapped>: @unchecked Sendable {
-        var wrappedValue: Wrapped
-        init(_ wrappedValue: Wrapped) {
+    private struct UnsafeTransfer: @unchecked Sendable {
+        var wrappedValue: () -> Void
+        init(_ wrappedValue: @escaping (() -> Void)) {
             self.wrappedValue = wrappedValue
         }
     }
 
     func runImmediate(_ task: @escaping (() -> Void)) {
         if self.eventLoop.inEventLoop {
-            self.eventLoop.assumeIsolated().execute(task)
+            self.eventLoop.assumeIsolatedUnsafeUnchecked().execute(task)
         } else {
             // Remove once this has landed: https://github.com/apple/swift-network-evolution/pull/36
             let transfer = UnsafeTransfer(task)
@@ -62,24 +67,44 @@ final class QUICChannelEventLoop: NetworkContext.Scheduler, CustomStringConverti
         milliseconds: Int64,
         reference: SwiftNetwork.TimerReference
     ) {
-        // First, wipe out any previously scheduled tasks with this handle
-        self.unschedule(reference: reference)
-        // Create the entry and schedule it
-        var scheduledEntry = ScheduledEntry(milliseconds: milliseconds, reference: reference)
-        scheduledEntry.scheduledTask = self.eventLoop.assumeIsolated().scheduleTask(
-            in: .milliseconds(scheduledEntry.milliseconds)
-        ) {
-            task()
+        // Get the isolated EL now: check that the caller is on the right EL _before_ modifying
+        // any state.
+        let isolatedEventLoop = self.eventLoop.assumeIsolated()
+
+        self.scheduledTasks.withEntry(
+            for: reference,
+            default: ScheduledEntry(task: task)
+        ) { entry in
+            // Cancel the existing task, if one is present.
+            let handle = entry.handle.take()
+            handle?.cancel()
+
+            // The entry may be pre-existing: it must run the task being scheduled now, not the
+            // task it was created with.
+            entry.task = task
+
+            // Scheduling can fail if the EL is shutdown: swallow the error.
+            entry.handle = try? isolatedEventLoop.scheduleCallback(
+                in: .milliseconds(milliseconds),
+                handler: entry
+            )
         }
-        self.scheduledTasks[reference] = scheduledEntry
     }
 
     func unschedule(reference: SwiftNetwork.TimerReference) {
-        if self.scheduledTasks.isEmpty {
-            return
-        }
         if let removedEntry = self.scheduledTasks.removeValue(forKey: reference) {
-            removedEntry.scheduledTask??.cancel()
+            removedEntry.handle?.cancel()
         }
+    }
+}
+
+@available(anyAppleOS 26, *)
+extension [TimerReference: ScheduledEntry] {
+    mutating func withEntry(
+        for reference: SwiftNetwork.TimerReference,
+        default: @autoclosure () -> ScheduledEntry,
+        execute body: (inout Value) -> Void
+    ) {
+        body(&self[reference, default: `default`()])
     }
 }
